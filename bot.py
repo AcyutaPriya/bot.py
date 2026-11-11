@@ -7,7 +7,7 @@ from typing import Literal, Tuple, List, Dict
 import pandas as pd
 from pydantic import BaseModel, Field
 
-# Force unbuffered output so print statements display instantly in GitHub Actions logs
+# Ensure output prints immediately in GitHub Actions logs
 sys.stdout.reconfigure(line_buffering=True)
 
 # --- Alpaca SDK ---
@@ -15,28 +15,24 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import (
     MarketOrderRequest,
     TakeProfitRequest,
-    StopLossRequest,
-    GetOrdersRequest
+    StopLossRequest
 )
-from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass, QueryOrderStatus
+from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 from alpaca.data.enums import DataFeed
 from alpaca.common.exceptions import APIError
 
-# --- AI SDK ---
+# --- Google GenAI SDK ---
 from google import genai
 from google.genai import types
 
-# ==============================================================================
-# 1. CREDENTIALS & INITIALIZATION
-# ==============================================================================
+# 1. Credentials
 ALPACA_KEY = os.getenv("ALPACA_API_KEY", "").strip()
 ALPACA_SECRET = os.getenv("ALPACA_SECRET_KEY", "").strip()
 FINNHUB_KEY = os.getenv("FINNHUB_API_KEY", "").strip()
 GEMINI_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-OPENAI_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 
 if not ALPACA_KEY or not ALPACA_SECRET:
     raise ValueError("Missing Alpaca API credentials in GitHub Secrets.")
@@ -45,9 +41,7 @@ trading_client = TradingClient(ALPACA_KEY, ALPACA_SECRET, paper=True)
 data_client = StockHistoricalDataClient(ALPACA_KEY, ALPACA_SECRET)
 
 
-# ==============================================================================
-# 2. FINNHUB MACROECONOMIC BLACKOUT ENGINE
-# ==============================================================================
+# 2. Economic News Filter (Finnhub)
 class FinnhubCalendarFilter:
     BASE_URL = "https://finnhub.io/api/v1/calendar/economic"
     CRITICAL_KEYWORDS = [
@@ -59,7 +53,7 @@ class FinnhubCalendarFilter:
     @classmethod
     def is_macro_blackout_today(cls) -> Tuple[bool, str]:
         if not FINNHUB_KEY:
-            print("[i] No FINNHUB_API_KEY provided. Skipping economic news calendar check.")
+            print("[i] No FINNHUB_API_KEY provided. Skipping news check.")
             return False, ""
 
         today_str = date.today().isoformat()
@@ -90,52 +84,10 @@ class FinnhubCalendarFilter:
         return False, ""
 
 
-# ==============================================================================
-# 3. POSITION RISK POLICY DURING BLACKOUTS
-# ==============================================================================
-def handle_blackout_positions(symbol: str, blackout_policy: str = "TIGHTEN_OR_FLATTEN"):
-    try:
-        position = trading_client.get_open_position(symbol)
-    except APIError:
-        print(f"[*] No open position in {symbol} to manage.")
-        return
-
-    qty = int(position.qty)
-    entry_price = float(position.avg_entry_price)
-    current_price = float(position.current_price)
-    unrealized_pl = float(position.unrealized_pl)
-
-    print(f"[*] Active Position: {qty} shares of {symbol} | Unrealized P&L: ${unrealized_pl:+.2f}")
-
-    if blackout_policy == "FLATTEN":
-        print(f"[!] FLATTEN: Closing all {symbol} positions to stay 100% in cash.")
-        trading_client.close_position(symbol)
-
-    elif blackout_policy == "TIGHTEN_OR_FLATTEN":
-        if current_price > entry_price * 1.005:
-            print(f"[+] Position is in profit. Moving Stop Loss to Breakeven (${entry_price:.2f})...")
-            trading_client.cancel_orders()
-            trading_client.submit_order(
-                MarketOrderRequest(
-                    symbol=symbol,
-                    qty=qty,
-                    side=OrderSide.SELL,
-                    time_in_force=TimeInForce.GTC,
-                    stop_loss=StopLossRequest(stop_price=round(entry_price, 2))
-                )
-            )
-        else:
-            print(f"[-] Position is flat or in loss. Liquidating before news volatility...")
-            trading_client.close_position(symbol)
-
-
-# ==============================================================================
-# 4. DATA EXTRACTION (COMPATIBLE WITH FREE ALPACA TIERS)
-# ==============================================================================
+# 3. Bar Extraction
 def fetch_bars_safe(symbol: str, timeframe: TimeFrame, days_back: int) -> pd.DataFrame:
     end_date = datetime.now()
     start_date = end_date - timedelta(days=days_back)
-
     req = StockBarsRequest(
         symbol_or_symbols=symbol,
         timeframe=timeframe,
@@ -150,121 +102,158 @@ def fetch_bars_safe(symbol: str, timeframe: TimeFrame, days_back: int) -> pd.Dat
 
 
 def extract_mtf_icc_metrics(symbol: str) -> dict:
-    try:
-        df_1h = fetch_bars_safe(symbol, TimeFrame.Hour, days_back=30)
-        df_1m = fetch_bars_safe(symbol, TimeFrame.Minute, days_back=5)
+    df_1h = fetch_bars_safe(symbol, TimeFrame.Hour, days_back=30)
+    df_1m = fetch_bars_safe(symbol, TimeFrame.Minute, days_back=5)
 
-        df_15m = df_1m.resample("15min").agg({
-            "open": "first",
-            "high": "max",
-            "low": "min",
-            "close": "last",
-            "volume": "sum"
-        }).dropna()
+    df_15m = df_1m.resample("15min").agg({
+        "open": "first",
+        "high": "max",
+        "low": "min",
+        "close": "last",
+        "volume": "sum"
+    }).dropna()
 
-        df_4h = df_1h.resample("4h").agg({
-            "open": "first",
-            "high": "max",
-            "low": "min",
-            "close": "last",
-            "volume": "sum"
-        }).dropna()
+    df_4h = df_1h.resample("4h").agg({
+        "open": "first",
+        "high": "max",
+        "low": "min",
+        "close": "last",
+        "volume": "sum"
+    }).dropna()
 
-        return {
-            "symbol": symbol,
-            "current_price": float(df_15m["close"].iloc[-1]),
-            "htf_4h": {
-                "close": float(df_4h["close"].iloc[-1]),
-                "swing_high": float(df_4h["high"].iloc[-20:].max()),
-                "swing_low": float(df_4h["low"].iloc[-20:].min()),
-                "trend_sma": round(float(df_4h["close"].rolling(20).mean().iloc[-1]), 2),
-            },
-            "ltf_15m": {
-                "breakout_trigger": float(df_15m["high"].iloc[-12:-3].max()),
-                "correction_low": float(df_15m["low"].iloc[-8:].min()),
-                "correction_high": float(df_15m["high"].iloc[-8:].max()),
-            },
-        }
-    except Exception as e:
-        print(f"[!] Error during bar extraction: {e}")
-        traceback.print_exc()
-        raise e
+    return {
+        "symbol": symbol,
+        "current_price": float(df_15m["close"].iloc[-1]),
+        "htf_4h": {
+            "close": float(df_4h["close"].iloc[-1]),
+            "swing_high": float(df_4h["high"].iloc[-20:].max()),
+            "swing_low": float(df_4h["low"].iloc[-20:].min()),
+            "trend_sma": round(float(df_4h["close"].rolling(20).mean().iloc[-1]), 2),
+        },
+        "ltf_15m": {
+            "breakout_trigger": float(df_15m["high"].iloc[-12:-3].max()),
+            "correction_low": float(df_15m["low"].iloc[-8:].min()),
+            "correction_high": float(df_15m["high"].iloc[-8:].max()),
+        },
+    }
 
 
-# ==============================================================================
-# 5. STRUCTURED AI AUDITOR & DECISION ENGINE
-# ==============================================================================
+# 4. AI Structured Decision Schema
 class MultiTimeframeICCDecision(BaseModel):
-    htf_bias: Literal["BULLISH", "BEARISH", "NEUTRAL"] = Field(description="4H structural impulse (Indication)")
+    htf_bias: Literal["BULLISH", "BEARISH", "NEUTRAL"] = Field(description="4H structural impulse")
     ltf_phase: Literal["CORRECTION", "CONTINUATION", "CHOP"] = Field(description="15M current phase")
-    action: Literal["BUY", "SELL", "HOLD"] = Field(description="Action command. BUY only if 4H is Bullish and 15M triggers Continuation.")
+    action: Literal["BUY", "SELL", "HOLD"] = Field(description="Action command")
     confidence_score: float = Field(description="Confidence from 0.0 to 1.0")
     reasoning: str = Field(description="Summary of ICC setup logic")
-    suggested_stop_loss: float = Field(description="Stop loss price level below 15M correction low")
-    suggested_take_profit: float = Field(description="Take profit price level with min 1:2 R:R")
+    suggested_stop_loss: float = Field(description="Stop loss price level")
+    suggested_take_profit: float = Field(description="Take profit price level")
 
 
 def get_ai_decision(market_data: dict) -> MultiTimeframeICCDecision:
     prompt = f"""
-    You are an automated risk and execution engine executing the ICC (Indication, Correction, Continuation) trading model:
+    You are an automated risk and execution engine executing the ICC (Indication, Correction, Continuation) model:
+    1. Indication (4H): Bullish if Close > Trend SMA and higher highs; else Bearish/Neutral.
+    2. Correction vs Continuation (15M):
+       - Pulling back/range: Phase = CORRECTION. Action = HOLD.
+       - 4H Bullish and 15M closes above correction high: Phase = CONTINUATION. Action = BUY.
+       - Otherwise Action = HOLD.
+    3. Risk: Stop-loss slightly below 15M correction low. Take-profit at least 1:2 R:R.
 
-    1. Indication (4H chart):
-       - If 4H Close > Trend Baseline SMA and printing higher highs, HTF Bias is BULLISH.
-       - Otherwise BEARISH or NEUTRAL.
-    2. Correction vs Continuation (15M chart):
-       - If pulling back or consolidating: Phase = CORRECTION. Action = HOLD. Never enter in correction.
-       - If 4H is BULLISH and 15M breaks above the correction high: Phase = CONTINUATION. Action = BUY.
-       - If conflicting, Action = HOLD.
-    3. Risk Parameters:
-       - Stop-loss MUST be slightly below the 15M correction low.
-       - Take-profit MUST deliver at least a 1:2 Risk-to-Reward ratio.
-
-    MARKET DATA FOR {market_data['symbol']}:
+    MARKET DATA:
     {market_data}
     """
 
-    if GEMINI_KEY:
-        ai_client = genai.Client(api_key=GEMINI_KEY)
-        response = ai_client.models.generate_content(
-            model="gemini-3.8-flash",
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema=MultiTimeframeICCDecision,
-                temperature=0.1,
-            ),
-        )
-        return MultiTimeframeICCDecision.model_validate_json(response.text)
+    if not GEMINI_KEY:
+        raise ValueError("Missing GEMINI_API_KEY in GitHub Secrets.")
 
-    elif OPENAI_KEY:
-        from openai import OpenAI
-        client = OpenAI(api_key=OPENAI_KEY)
-        res = client.beta.chat.completions.parse(
-            model="gpt-4o",
-            messages=[
-                {"role": "system", "content": "You are a quantitative trading controller enforcing ICC rules."},
-                {"role": "user", "content": prompt}
-            ],
-            response_format=MultiTimeframeICCDecision
-        )
-        return res.choices[0].message.parsed
-    else:
-        raise ValueError("Neither GEMINI_API_KEY nor OPENAI_API_KEY was found in secrets.")
+    ai_client = genai.Client(api_key=GEMINI_KEY)
+    response = ai_client.models.generate_content(
+        model="gemini-3.8-flash",
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=MultiTimeframeICCDecision,
+            temperature=0.1,
+        ),
+    )
+    return MultiTimeframeICCDecision.model_validate_json(response.text)
 
 
-# ==============================================================================
-# 6. SELF-AUDIT: PERFORMANCE & RETURN RATE CHECK
-# ==============================================================================
+# 5. Self Audit
 def run_performance_self_audit():
     account = trading_client.get_account()
     equity = float(account.equity)
     last_equity = float(account.last_equity)
     cash = float(account.cash)
 
-    day_return_pct = ((equity - last_equity) / last_equity) * 100 if last_equity > 0 else 0.0
+    day_return_pct = 0.0
+    if last_equity > 0:
+        day_return_pct = ((equity - last_equity) / last_equity) * 100
 
-    print("\n" + "=" * 55)
-    print("               PORTFOLIO PERFORMANCE AUDIT             ")
-    print("=" * 55)
-    print(f"Current Equity Value : ${equity:,.2f}")
-    print(f"Available Cash       : ${cash:,.
+    print("=" * 50)
+    print("PORTFOLIO AUDIT")
+    print("Current Equity: $" + f"{equity:,.2f}")
+    print("Available Cash: $" + f"{cash:,.2f}")
+    print("Today's Return: " + f"{day_return_pct:+.2f}%")
+    print("=" * 50)
+
+
+# 6. Main Runner
+def run_bot(symbol: str = "SPY", qty: int = 1):
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Starting ICC Run for {symbol}...")
+
+    # Step A: Portfolio Audit
+    run_performance_self_audit()
+
+    # Step B: News Check
+    is_blocked, reason = FinnhubCalendarFilter.is_macro_blackout_today()
+    if is_blocked:
+        print(f"[BLOCKED] Trading halted today due to macro news: {reason}")
+        return
+
+    # Step C: Existing Position
+    open_qty = 0
+    try:
+        open_qty = int(trading_client.get_open_position(symbol).qty)
+    except APIError:
+        open_qty = 0
+
+    # Step D: Market Metrics & AI Decision
+    print(f"[*] Extracting 4H and 15M metrics for {symbol}...")
+    metrics = extract_mtf_icc_metrics(symbol)
+
+    print("[*] Requesting AI analysis...")
+    decision = get_ai_decision(metrics)
+
+    print(f"\n[AI Verdict] Action: {decision.action} | Confidence: {decision.confidence_score * 100:.1f}%")
+    print(f"4H Bias: {decision.htf_bias} | 15M Phase: {decision.ltf_phase}")
+    print(f"Reasoning: {decision.reasoning}\n")
+
+    # Step E: Order Execution
+    if decision.action == "BUY" and open_qty == 0 and decision.confidence_score >= 0.75:
+        if decision.suggested_stop_loss >= metrics["current_price"]:
+            print("[!] Invalid Stop Loss returned by AI model. Aborting trade.")
+            return
+
+        print(f"[+] Placing BUY bracket order for {qty} share(s) of {symbol}...")
+        order_req = MarketOrderRequest(
+            symbol=symbol,
+            qty=qty,
+            side=OrderSide.BUY,
+            time_in_force=TimeInForce.GTC,
+            order_class=OrderClass.BRACKET,
+            take_profit=TakeProfitRequest(limit_price=round(decision.suggested_take_profit, 2)),
+            stop_loss=StopLossRequest(stop_price=round(decision.suggested_stop_loss, 2)),
+        )
+        order = trading_client.submit_order(order_req)
+        print(f"[✓] Bracket Order placed on Alpaca! Order ID: {order.id}")
+
+    elif decision.action == "SELL" and open_qty > 0:
+        print(f"[-] AI signaled exit. Liquidating {open_qty} shares of {symbol}...")
+        trading_client.close_position(symbol)
+    else:
+        print(f"[*] No trade executed. Current position: {open_qty} shares of {symbol}.")
+
+
+if __name__ == "__main__":
+    run_bot(symbol="SPY", qty=1)

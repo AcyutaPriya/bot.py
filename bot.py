@@ -1,5 +1,6 @@
 import os
 import requests
+import traceback
 from datetime import datetime, timedelta, date
 from typing import Literal, Tuple, List, Dict
 import pandas as pd
@@ -16,24 +17,25 @@ from alpaca.trading.requests import (
 from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass, QueryOrderStatus
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
-from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+from alpaca.data.timeframe import TimeFrame
+from alpaca.data.enums import DataFeed
 from alpaca.common.exceptions import APIError
 
-# --- AI SDK (Gemini by default; switchable to OpenAI) ---
+# --- AI SDK ---
 from google import genai
 from google.genai import types
 
 # ==============================================================================
 # 1. CREDENTIALS & INITIALIZATION
 # ==============================================================================
-ALPACA_KEY = os.getenv("ALPACA_API_KEY")
-ALPACA_SECRET = os.getenv("ALPACA_SECRET_KEY")
-FINNHUB_KEY = os.getenv("FINNHUB_API_KEY")
-GEMINI_KEY = os.getenv("GEMINI_API_KEY")
-OPENAI_KEY = os.getenv("OPENAI_API_KEY")
+ALPACA_KEY = os.getenv("ALPACA_API_KEY", "").strip()
+ALPACA_SECRET = os.getenv("ALPACA_SECRET_KEY", "").strip()
+FINNHUB_KEY = os.getenv("FINNHUB_API_KEY", "").strip()
+GEMINI_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+OPENAI_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 
 if not ALPACA_KEY or not ALPACA_SECRET:
-    raise ValueError("Missing Alpaca API credentials in environment secrets.")
+    raise ValueError("Missing Alpaca API credentials in GitHub Secrets.")
 
 trading_client = TradingClient(ALPACA_KEY, ALPACA_SECRET, paper=True)
 data_client = StockHistoricalDataClient(ALPACA_KEY, ALPACA_SECRET)
@@ -102,7 +104,7 @@ def handle_blackout_positions(symbol: str, blackout_policy: str = "TIGHTEN_OR_FL
         trading_client.close_position(symbol)
 
     elif blackout_policy == "TIGHTEN_OR_FLATTEN":
-        if current_price > entry_price * 1.005:  # In profit by >= 0.5%
+        if current_price > entry_price * 1.005:
             print(f"[+] Position is in profit. Moving Stop Loss to Breakeven (${entry_price:.2f})...")
             trading_client.cancel_orders()
             trading_client.submit_order(
@@ -120,12 +122,20 @@ def handle_blackout_positions(symbol: str, blackout_policy: str = "TIGHTEN_OR_FL
 
 
 # ==============================================================================
-# 4. MULTI-TIMEFRAME DATA GATHERING (4H & 15M)
+# 4. DATA EXTRACTION (COMPATIBLE WITH FREE ALPACA TIERS)
 # ==============================================================================
-def fetch_dataframe(symbol: str, timeframe: TimeFrame, days_back: int) -> pd.DataFrame:
+def fetch_bars_safe(symbol: str, timeframe: TimeFrame, days_back: int) -> pd.DataFrame:
     end_date = datetime.now()
     start_date = end_date - timedelta(days=days_back)
-    req = StockBarsRequest(symbol_or_symbols=symbol, timeframe=timeframe, start=start_date, end=end_date)
+    
+    # feed=DataFeed.IEX ensures free paper accounts don't fail with 403 on premium SIP feeds
+    req = StockBarsRequest(
+        symbol_or_symbols=symbol,
+        timeframe=timeframe,
+        start=start_date,
+        end=end_date,
+        feed=DataFeed.IEX
+    )
     bars = data_client.get_stock_bars(req).df
     if isinstance(bars.index, pd.MultiIndex):
         bars = bars.xs(symbol, level="symbol")
@@ -133,27 +143,48 @@ def fetch_dataframe(symbol: str, timeframe: TimeFrame, days_back: int) -> pd.Dat
 
 
 def extract_mtf_icc_metrics(symbol: str) -> dict:
-    timeframe_4h = TimeFrame(4, TimeFrameUnit.Hour)
-    timeframe_15m = TimeFrame(15, TimeFrameUnit.Minute)
+    try:
+        # Pull 1-hour bars for HTF structure
+        df_1h = fetch_bars_safe(symbol, TimeFrame.Hour, days_back=30)
+        
+        # Pull minute bars and resample to 15-minute bars
+        df_1m = fetch_bars_safe(symbol, TimeFrame.Minute, days_back=5)
+        df_15m = df_1m.resample("15min").agg({
+            "open": "first",
+            "high": "max",
+            "low": "min",
+            "close": "last",
+            "volume": "sum"
+        }).dropna()
 
-    df_4h = fetch_dataframe(symbol, timeframe=timeframe_4h, days_back=35)
-    df_15m = fetch_dataframe(symbol, timeframe=timeframe_15m, days_back=5)
+        # HTF: Calculate 4H bars by resampling 1H data
+        df_4h = df_1h.resample("4h").agg({
+            "open": "first",
+            "high": "max",
+            "low": "min",
+            "close": "last",
+            "volume": "sum"
+        }).dropna()
 
-    return {
-        "symbol": symbol,
-        "current_price": float(df_15m["close"].iloc[-1]),
-        "htf_4h": {
-            "close": float(df_4h["close"].iloc[-1]),
-            "swing_high": float(df_4h["high"].iloc[-20:].max()),
-            "swing_low": float(df_4h["low"].iloc[-20:].min()),
-            "trend_sma": round(float(df_4h["close"].rolling(20).mean().iloc[-1]), 2),
-        },
-        "ltf_15m": {
-            "breakout_trigger": float(df_15m["high"].iloc[-12:-3].max()),
-            "correction_low": float(df_15m["low"].iloc[-8:].min()),
-            "correction_high": float(df_15m["high"].iloc[-8:].max()),
-        },
-    }
+        return {
+            "symbol": symbol,
+            "current_price": float(df_15m["close"].iloc[-1]),
+            "htf_4h": {
+                "close": float(df_4h["close"].iloc[-1]),
+                "swing_high": float(df_4h["high"].iloc[-20:].max()),
+                "swing_low": float(df_4h["low"].iloc[-20:].min()),
+                "trend_sma": round(float(df_4h["close"].rolling(20).mean().iloc[-1]), 2),
+            },
+            "ltf_15m": {
+                "breakout_trigger": float(df_15m["high"].iloc[-12:-3].max()),
+                "correction_low": float(df_15m["low"].iloc[-8:].min()),
+                "correction_high": float(df_15m["high"].iloc[-8:].max()),
+            },
+        }
+    except Exception as e:
+        print(f"[!] Error during bar extraction: {e}")
+        traceback.print_exc()
+        raise e
 
 
 # ==============================================================================
@@ -244,58 +275,4 @@ def run_bot(symbol: str = "SPY", qty: int = 1):
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Starting ICC Run for {symbol}...")
 
     # Step 1: Self performance audit
-    run_performance_self_audit()
-
-    # Step 2: High-impact economic news filter
-    is_blocked, reason = FinnhubCalendarFilter.is_macro_blackout_today()
-    if is_blocked:
-        print(f"[BLOCKED] Trading halted today due to high-impact macro news: {reason}")
-        handle_blackout_positions(symbol, blackout_policy="TIGHTEN_OR_FLATTEN")
-        return
-
-    # Step 3: Check open positions
-    open_qty = 0
-    try:
-        open_qty = int(trading_client.get_open_position(symbol).qty)
-    except APIError:
-        open_qty = 0
-
-    # Step 4: Extract MTF technical data & run AI model
-    print(f"[*] Extracting 4H Indication and 15M Continuation metrics for {symbol}...")
-    metrics = extract_mtf_icc_metrics(symbol)
-
-    print("[*] Passing market structure to AI reasoning agent...")
-    decision = get_ai_decision(metrics)
-
-    print(f"\n[AI Verdict] Action: {decision.action} | Confidence: {decision.confidence_score * 100:.1f}%")
-    print(f"4H Bias: {decision.htf_bias} | 15M Phase: {decision.ltf_phase}")
-    print(f"Reasoning: {decision.reasoning}\n")
-
-    # Step 5: Execute bracket orders if criteria are met
-    if decision.action == "BUY" and open_qty == 0 and decision.confidence_score >= 0.75:
-        if decision.suggested_stop_loss >= metrics["current_price"]:
-            print("[!] Invalid Stop Loss returned by AI model. Aborting trade.")
-            return
-
-        print(f"[+] Placing BUY bracket order for {qty} share(s) of {symbol}...")
-        order_req = MarketOrderRequest(
-            symbol=symbol,
-            qty=qty,
-            side=OrderSide.BUY,
-            time_in_force=TimeInForce.GTC,
-            order_class=OrderClass.BRACKET,
-            take_profit=TakeProfitRequest(limit_price=round(decision.suggested_take_profit, 2)),
-            stop_loss=StopLossRequest(stop_price=round(decision.suggested_stop_loss, 2)),
-        )
-        order = trading_client.submit_order(order_req)
-        print(f"[✓] Bracket Order placed on Alpaca! Order ID: {order.id}")
-
-    elif decision.action == "SELL" and open_qty > 0:
-        print(f"[-] AI signaled exit. Liquidating {open_qty} shares of {symbol}...")
-        trading_client.close_position(symbol)
-    else:
-        print(f"[*] No trade executed. Holding {open_qty} shares of {symbol}.")
-
-
-if __name__ == "__main__":
-    run_bot(symbol="SPY", qty=1)
+    run_performance_self_

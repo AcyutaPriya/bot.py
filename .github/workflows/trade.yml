@@ -2,14 +2,13 @@ name: Alpaca ICC Trading Bot
 
 on:
   schedule:
-    # Runs every 15 minutes during US market hours (Mon-Fri)
-    - cron: '*/15 13-20 * * 1-5'
-  workflow_dispatch: # Enables the manual "Run workflow" test button
+    # 14:00 - 21:00 UTC covers 8:00 AM - 3:00 PM Central (9:00 AM - 4:00 PM Eastern)
+    - cron: '*/15 14-21 * * 1-5'
+  workflow_dispatch:
 
 jobs:
   run-trading-bot:
     runs-on: ubuntu-latest
-
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -20,8 +19,7 @@ jobs:
           python-version: '3.11'
 
       - name: Install Libraries
-        run: |
-          pip install google-genai openai alpaca-py pydantic pandas requests
+        run: pip install google-genai openai alpaca-py pydantic pandas requests
 
       - name: Run Bot
         env:
@@ -30,5 +28,4 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
-        run: |
-          python -u bot.py
+        run: python -u bot.py

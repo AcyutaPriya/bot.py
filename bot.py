@@ -1,10 +1,14 @@
 import os
+import sys
 import requests
 import traceback
 from datetime import datetime, timedelta, date
 from typing import Literal, Tuple, List, Dict
 import pandas as pd
 from pydantic import BaseModel, Field
+
+# Force unbuffered output so print statements display instantly in GitHub Actions logs
+sys.stdout.reconfigure(line_buffering=True)
 
 # --- Alpaca SDK ---
 from alpaca.trading.client import TradingClient
@@ -60,11 +64,15 @@ class FinnhubCalendarFilter:
 
         today_str = date.today().isoformat()
         try:
-            res = requests.get(cls.BASE_URL, params={"from": today_str, "to": today_str, "token": FINNHUB_KEY}, timeout=10)
+            res = requests.get(
+                cls.BASE_URL, 
+                params={"from": today_str, "to": today_str, "token": FINNHUB_KEY}, 
+                timeout=10
+            )
             res.raise_for_status()
             events = res.json().get("economicCalendar", [])
         except Exception as e:
-            print(f"[!] Warning: Finnhub API check failed ({e}). Defaulting to open trading.")
+            print(f"[!] Warning: Finnhub API check skipped ({e}). Defaulting to open trading.")
             return False, ""
 
         for item in events:
@@ -128,7 +136,6 @@ def fetch_bars_safe(symbol: str, timeframe: TimeFrame, days_back: int) -> pd.Dat
     end_date = datetime.now()
     start_date = end_date - timedelta(days=days_back)
     
-    # feed=DataFeed.IEX ensures free paper accounts don't fail with 403 on premium SIP feeds
     req = StockBarsRequest(
         symbol_or_symbols=symbol,
         timeframe=timeframe,
@@ -145,134 +152,3 @@ def fetch_bars_safe(symbol: str, timeframe: TimeFrame, days_back: int) -> pd.Dat
 def extract_mtf_icc_metrics(symbol: str) -> dict:
     try:
         # Pull 1-hour bars for HTF structure
-        df_1h = fetch_bars_safe(symbol, TimeFrame.Hour, days_back=30)
-        
-        # Pull minute bars and resample to 15-minute bars
-        df_1m = fetch_bars_safe(symbol, TimeFrame.Minute, days_back=5)
-        df_15m = df_1m.resample("15min").agg({
-            "open": "first",
-            "high": "max",
-            "low": "min",
-            "close": "last",
-            "volume": "sum"
-        }).dropna()
-
-        # HTF: Calculate 4H bars by resampling 1H data
-        df_4h = df_1h.resample("4h").agg({
-            "open": "first",
-            "high": "max",
-            "low": "min",
-            "close": "last",
-            "volume": "sum"
-        }).dropna()
-
-        return {
-            "symbol": symbol,
-            "current_price": float(df_15m["close"].iloc[-1]),
-            "htf_4h": {
-                "close": float(df_4h["close"].iloc[-1]),
-                "swing_high": float(df_4h["high"].iloc[-20:].max()),
-                "swing_low": float(df_4h["low"].iloc[-20:].min()),
-                "trend_sma": round(float(df_4h["close"].rolling(20).mean().iloc[-1]), 2),
-            },
-            "ltf_15m": {
-                "breakout_trigger": float(df_15m["high"].iloc[-12:-3].max()),
-                "correction_low": float(df_15m["low"].iloc[-8:].min()),
-                "correction_high": float(df_15m["high"].iloc[-8:].max()),
-            },
-        }
-    except Exception as e:
-        print(f"[!] Error during bar extraction: {e}")
-        traceback.print_exc()
-        raise e
-
-
-# ==============================================================================
-# 5. STRUCTURED AI AUDITOR & DECISION ENGINE
-# ==============================================================================
-class MultiTimeframeICCDecision(BaseModel):
-    htf_bias: Literal["BULLISH", "BEARISH", "NEUTRAL"] = Field(description="4H structural impulse (Indication)")
-    ltf_phase: Literal["CORRECTION", "CONTINUATION", "CHOP"] = Field(description="15M current phase")
-    action: Literal["BUY", "SELL", "HOLD"] = Field(description="Action command. BUY only if 4H is Bullish and 15M triggers Continuation.")
-    confidence_score: float = Field(description="Confidence from 0.0 to 1.0")
-    reasoning: str = Field(description="Summary of ICC setup logic")
-    suggested_stop_loss: float = Field(description="Stop loss price level below 15M correction low")
-    suggested_take_profit: float = Field(description="Take profit price level with min 1:2 R:R")
-
-
-def get_ai_decision(market_data: dict) -> MultiTimeframeICCDecision:
-    prompt = f"""
-    You are an automated risk and execution engine executing the ICC (Indication, Correction, Continuation) trading model:
-    
-    1. Indication (4H chart):
-       - If 4H Close > Trend Baseline SMA and printing higher highs, HTF Bias is BULLISH.
-       - Otherwise BEARISH or NEUTRAL.
-    2. Correction vs Continuation (15M chart):
-       - If pulling back or consolidating: Phase = CORRECTION. Action = HOLD. Never enter in correction.
-       - If 4H is BULLISH and 15M breaks above the correction high: Phase = CONTINUATION. Action = BUY.
-       - If conflicting, Action = HOLD.
-    3. Risk Parameters:
-       - Stop-loss MUST be slightly below the 15M correction low.
-       - Take-profit MUST deliver at least a 1:2 Risk-to-Reward ratio.
-
-    MARKET DATA FOR {market_data['symbol']}:
-    {market_data}
-    """
-
-    if GEMINI_KEY:
-        ai_client = genai.Client(api_key=GEMINI_KEY)
-        response = ai_client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema=MultiTimeframeICCDecision,
-                temperature=0.1,
-            ),
-        )
-        return MultiTimeframeICCDecision.model_validate_json(response.text)
-
-    elif OPENAI_KEY:
-        from openai import OpenAI
-        client = OpenAI(api_key=OPENAI_KEY)
-        res = client.beta.chat.completions.parse(
-            model="gpt-4o",
-            messages=[
-                {"role": "system", "content": "You are a quantitative trading controller enforcing ICC rules."},
-                {"role": "user", "content": prompt}
-            ],
-            response_format=MultiTimeframeICCDecision
-        )
-        return res.choices[0].message.parsed
-    else:
-        raise ValueError("Neither GEMINI_API_KEY nor OPENAI_API_KEY was found in secrets.")
-
-
-# ==============================================================================
-# 6. SELF-AUDIT: PERFORMANCE & RETURN RATE CHECK
-# ==============================================================================
-def run_performance_self_audit():
-    account = trading_client.get_account()
-    equity = float(account.equity)
-    last_equity = float(account.last_equity)
-    cash = float(account.cash)
-
-    day_return_pct = ((equity - last_equity) / last_equity) * 100 if last_equity > 0 else 0.0
-
-    print("\n" + "=" * 55)
-    print("               PORTFOLIO PERFORMANCE AUDIT             ")
-    print("=" * 55)
-    print(f"Current Equity Value : ${equity:,.2f}")
-    print(f"Available Cash       : ${cash:,.2f}")
-    print(f"Session Return Rate  : {day_return_pct:+.2f}%")
-    print("=" * 55 + "\n")
-
-
-# ==============================================================================
-# 7. MAIN BOT LOOP
-# ==============================================================================
-def run_bot(symbol: str = "SPY", qty: int = 1):
-    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Starting ICC Run for {symbol}...")
-
-    # Step 1: Self performance audit
-    run_performance_self_

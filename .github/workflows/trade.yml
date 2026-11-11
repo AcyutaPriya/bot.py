@@ -19,13 +19,12 @@ jobs:
           python-version: '3.11'
 
       - name: Install Libraries
-        run: pip install google-genai openai alpaca-py pydantic pandas requests
+        run: pip install openai alpaca-py pydantic pandas requests
 
       - name: Run Bot
         env:
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
         run: python -u bot.py

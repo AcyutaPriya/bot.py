@@ -1,5 +1,6 @@
 import os
 import sys
+import time
 import requests
 import traceback
 from datetime import datetime, timedelta, date
@@ -167,16 +168,38 @@ def get_ai_decision(market_data: dict) -> MultiTimeframeICCDecision:
         raise ValueError("Missing GEMINI_API_KEY in GitHub Secrets.")
 
     ai_client = genai.Client(api_key=GEMINI_KEY)
-    response = ai_client.models.generate_content(
-        model="gemini-3.8-flash",
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=MultiTimeframeICCDecision,
-            temperature=0.1,
-        ),
-    )
-    return MultiTimeframeICCDecision.model_validate_json(response.text)
+
+    # Retry loop with backoff to handle transient 503 high-demand spikes
+    max_retries = 3
+    for attempt in range(1, max_retries + 1):
+        try:
+            response = ai_client.models.generate_content(
+                model="gemini-3.8-flash",
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=MultiTimeframeICCDecision,
+                    temperature=0.1,
+                ),
+            )
+            return MultiTimeframeICCDecision.model_validate_json(response.text)
+        except Exception as e:
+            print(f"[!] AI request attempt {attempt} failed ({e}).")
+            if attempt < max_retries:
+                sleep_sec = attempt * 4
+                print(f"[*] Backing off for {sleep_sec}s before retry...")
+                time.sleep(sleep_sec)
+            else:
+                print("[!] AI service unavailable after 3 attempts. Safely defaulting to HOLD.")
+                return MultiTimeframeICCDecision(
+                    htf_bias="NEUTRAL",
+                    ltf_phase="CHOP",
+                    action="HOLD",
+                    confidence_score=0.0,
+                    reasoning=f"AI service temporarily unavailable (503). Position preserved.",
+                    suggested_stop_loss=0.0,
+                    suggested_take_profit=0.0
+                )
 
 
 # 5. Self Audit

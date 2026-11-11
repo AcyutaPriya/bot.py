@@ -25,24 +25,31 @@ from alpaca.data.timeframe import TimeFrame
 from alpaca.data.enums import DataFeed
 from alpaca.common.exceptions import APIError
 
-# --- Google GenAI SDK ---
-from google import genai
-from google.genai import types
+# --- OpenAI SDK ---
+from openai import OpenAI
 
-# 1. Credentials
+# ==============================================================================
+# 1. CREDENTIALS & INITIALIZATION
+# ==============================================================================
 ALPACA_KEY = os.getenv("ALPACA_API_KEY", "").strip()
 ALPACA_SECRET = os.getenv("ALPACA_SECRET_KEY", "").strip()
 FINNHUB_KEY = os.getenv("FINNHUB_API_KEY", "").strip()
-GEMINI_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+OPENAI_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 
 if not ALPACA_KEY or not ALPACA_SECRET:
     raise ValueError("Missing Alpaca API credentials in GitHub Secrets.")
 
+if not OPENAI_KEY:
+    raise ValueError("Missing OPENAI_API_KEY in GitHub Secrets.")
+
 trading_client = TradingClient(ALPACA_KEY, ALPACA_SECRET, paper=True)
 data_client = StockHistoricalDataClient(ALPACA_KEY, ALPACA_SECRET)
+ai_client = OpenAI(api_key=OPENAI_KEY)
 
 
-# 2. Economic News Filter (Finnhub)
+# ==============================================================================
+# 2. FINNHUB MACROECONOMIC BLACKOUT ENGINE
+# ==============================================================================
 class FinnhubCalendarFilter:
     BASE_URL = "https://finnhub.io/api/v1/calendar/economic"
     CRITICAL_KEYWORDS = [
@@ -85,7 +92,9 @@ class FinnhubCalendarFilter:
         return False, ""
 
 
-# 3. Bar Extraction
+# ==============================================================================
+# 3. BAR EXTRACTION
+# ==============================================================================
 def fetch_bars_safe(symbol: str, timeframe: TimeFrame, days_back: int) -> pd.DataFrame:
     end_date = datetime.now()
     start_date = end_date - timedelta(days=days_back)
@@ -139,7 +148,9 @@ def extract_mtf_icc_metrics(symbol: str) -> dict:
     }
 
 
-# 4. AI Structured Decision Schema
+# ==============================================================================
+# 4. OPENAI STRUCTURED DECISION ENGINE
+# ==============================================================================
 class MultiTimeframeICCDecision(BaseModel):
     htf_bias: Literal["BULLISH", "BEARISH", "NEUTRAL"] = Field(description="4H structural impulse")
     ltf_phase: Literal["CORRECTION", "CONTINUATION", "CHOP"] = Field(description="15M current phase")
@@ -164,45 +175,44 @@ def get_ai_decision(market_data: dict) -> MultiTimeframeICCDecision:
     {market_data}
     """
 
-    if not GEMINI_KEY:
-        raise ValueError("Missing GEMINI_API_KEY in GitHub Secrets.")
-
-    ai_client = genai.Client(api_key=GEMINI_KEY)
-
-    # Retry loop with backoff to handle transient 503 high-demand spikes
     max_retries = 3
     for attempt in range(1, max_retries + 1):
         try:
-            response = ai_client.models.generate_content(
-                model="gemini-3.8-flash",
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=MultiTimeframeICCDecision,
-                    temperature=0.1,
-                ),
+            completion = ai_client.beta.chat.completions.parse(
+                model="gpt-4o",
+                messages=[
+                    {"role": "system", "content": "You are a quantitative trading controller enforcing ICC rules."},
+                    {"role": "user", "content": prompt}
+                ],
+                response_format=MultiTimeframeICCDecision,
+                temperature=0.1
             )
-            return MultiTimeframeICCDecision.model_validate_json(response.text)
+            parsed = completion.choices[0].message.parsed
+            if parsed is not None:
+                return parsed
+            raise ValueError("OpenAI returned an empty parsed response.")
         except Exception as e:
-            print(f"[!] AI request attempt {attempt} failed ({e}).")
+            print(f"[!] OpenAI request attempt {attempt} failed ({e}).")
             if attempt < max_retries:
-                sleep_sec = attempt * 4
+                sleep_sec = attempt * 3
                 print(f"[*] Backing off for {sleep_sec}s before retry...")
                 time.sleep(sleep_sec)
             else:
-                print("[!] AI service unavailable after 3 attempts. Safely defaulting to HOLD.")
+                print("[!] OpenAI unavailable after 3 attempts. Safely defaulting to HOLD.")
                 return MultiTimeframeICCDecision(
                     htf_bias="NEUTRAL",
                     ltf_phase="CHOP",
                     action="HOLD",
                     confidence_score=0.0,
-                    reasoning=f"AI service temporarily unavailable (503). Position preserved.",
+                    reasoning=f"AI service unavailable ({e}). Position preserved.",
                     suggested_stop_loss=0.0,
                     suggested_take_profit=0.0
                 )
 
 
-# 5. Self Audit
+# ==============================================================================
+# 5. SELF-AUDIT
+# ==============================================================================
 def run_performance_self_audit():
     account = trading_client.get_account()
     equity = float(account.equity)
@@ -221,7 +231,9 @@ def run_performance_self_audit():
     print("=" * 50)
 
 
-# 6. Main Runner
+# ==============================================================================
+# 6. MAIN RUNNER
+# ==============================================================================
 def run_bot(symbol: str = "SPY", qty: int = 1):
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Starting ICC Run for {symbol}...")
 
@@ -245,7 +257,7 @@ def run_bot(symbol: str = "SPY", qty: int = 1):
     print(f"[*] Extracting 4H and 15M metrics for {symbol}...")
     metrics = extract_mtf_icc_metrics(symbol)
 
-    print("[*] Requesting AI analysis...")
+    print("[*] Requesting OpenAI (GPT-4o) analysis...")
     decision = get_ai_decision(metrics)
 
     print(f"\n[AI Verdict] Action: {decision.action} | Confidence: {decision.confidence_score * 100:.1f}%")

@@ -2,7 +2,7 @@ name: Alpaca ICC Trading Bot
 
 on:
   schedule:
-    # 14:00 - 21:00 UTC covers 8:00 AM - 3:00 PM Central (9:00 AM - 4:00 PM Eastern)
+    # Runs every 15 minutes during US market hours (14:30 - 21:00 UTC / 8:30 AM - 3:00 PM Central)
     - cron: '*/15 14-21 * * 1-5'
   workflow_dispatch:
 
